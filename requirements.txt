@@ -1,0 +1,9 @@
+numpy
+faiss-cpu
+sentence-transformers
+PyPDF2
+streamlit
+pandas
+scikit-learn
+pytest
+tqdm
