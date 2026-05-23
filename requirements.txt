@@ -1,9 +1,7 @@
-numpy
-faiss-cpu
+﻿streamlit
 sentence-transformers
+faiss-cpu
 PyPDF2
-streamlit
 pandas
+numpy
 scikit-learn
-pytest
-tqdm
