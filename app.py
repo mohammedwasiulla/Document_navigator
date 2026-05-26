@@ -25,6 +25,18 @@ st.set_page_config(
     initial_sidebar_state="expanded",
 )
 
+# ── Toast Message ─────────────────────────────
+if "toast_shown" not in st.session_state:
+    st.session_state.toast_shown = False
+
+if not st.session_state.toast_shown:
+    st.toast(
+        "Use the sidebar to upload your PDF documents or adjust the precision and confidence settings for improved retrieval accuracy.",
+        icon="ℹ️"
+    )
+
+    st.session_state.toast_shown = True
+
 st.markdown("""
 <style>
 @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap');
