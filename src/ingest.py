@@ -1,17 +1,56 @@
 import json
 import os
+import re
 from typing import List, Dict
-from PyPDF2 import PdfReader
+
+
+def clean_text(text: str) -> str:
+    """Clean PDF-extracted text: remove stray bullets, collapse whitespace, fix broken words."""
+    # Remove lines that are only whitespace/bullets/symbols (PyPDF2 artefacts)
+    lines = text.splitlines()
+    cleaned = []
+    for line in lines:
+        stripped = line.strip()
+        # Skip lines that are empty or only bullet/symbol noise
+        if not stripped:
+            continue
+        if re.match(r'^[•\-\*\s]+$', stripped):
+            continue
+        # Collapse excess internal whitespace
+        stripped = re.sub(r'[ \t]{2,}', ' ', stripped)
+        cleaned.append(stripped)
+    result = '\n'.join(cleaned)
+    # Collapse 3+ blank lines to 2
+    result = re.sub(r'\n{3,}', '\n\n', result)
+    return result.strip()
 
 
 def extract_pages_from_pdf(path: str) -> List[Dict]:
-    reader = PdfReader(path)
+    """Extract text page-by-page using pdfplumber (layout-aware), fall back to PyPDF2."""
     pages = []
+    try:
+        import pdfplumber
+        with pdfplumber.open(path) as pdf:
+            for i, page in enumerate(pdf.pages, start=1):
+                try:
+                    text = page.extract_text(x_tolerance=3, y_tolerance=3) or ""
+                except Exception:
+                    text = ""
+                text = clean_text(text)
+                pages.append({"page_num": i, "text": text})
+        return pages
+    except ImportError:
+        pass  # fall back to PyPDF2
+
+    # Fallback: PyPDF2
+    from PyPDF2 import PdfReader
+    reader = PdfReader(path)
     for i, page in enumerate(reader.pages, start=1):
         try:
             text = page.extract_text() or ""
         except Exception:
             text = ""
+        text = clean_text(text)
         pages.append({"page_num": i, "text": text})
     return pages
 
@@ -19,22 +58,37 @@ def extract_pages_from_pdf(path: str) -> List[Dict]:
 def chunk_text(text: str, chunk_size: int = 1000, overlap: int = 200) -> List[str]:
     if chunk_size <= overlap:
         raise ValueError("chunk_size must be larger than overlap")
+    # Split on paragraph/section boundaries first, then fall back to character window
+    # This keeps semantically related content together
+    paragraphs = re.split(r'\n{2,}', text)
     chunks = []
-    start = 0
-    length = len(text)
-    while start < length:
-        end = min(start + chunk_size, length)
-        chunk = text[start:end].strip()
-        if chunk:
-            chunks.append(chunk)
-        # if we've reached the final window, stop to avoid looping when
-        # chunk_size > length or when end == length and overlap pushes start
-        if end >= length:
-            break
-        start = end - overlap
-        if start < 0:
-            start = 0
-    return chunks
+    current = ""
+    for para in paragraphs:
+        para = para.strip()
+        if not para:
+            continue
+        if len(current) + len(para) + 1 <= chunk_size:
+            current = (current + "\n" + para).strip() if current else para
+        else:
+            if current:
+                chunks.append(current)
+            # If paragraph itself is longer than chunk_size, split by character window
+            if len(para) > chunk_size:
+                start = 0
+                while start < len(para):
+                    end = min(start + chunk_size, len(para))
+                    piece = para[start:end].strip()
+                    if piece:
+                        chunks.append(piece)
+                    if end >= len(para):
+                        break
+                    start = end - overlap
+                current = ""
+            else:
+                current = para
+    if current:
+        chunks.append(current)
+    return [c for c in chunks if len(c.strip()) > 30]
 
 
 def ingest_pdfs(pdf_dir: str, out_chunks_path: str, chunk_size: int = 1000, overlap: int = 200):
@@ -66,7 +120,6 @@ def ingest_pdfs(pdf_dir: str, out_chunks_path: str, chunk_size: int = 1000, over
 
 if __name__ == "__main__":
     import argparse
-
     p = argparse.ArgumentParser()
     p.add_argument("pdf_dir")
     p.add_argument("out_chunks")
