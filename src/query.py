@@ -3,8 +3,7 @@ import os
 from sentence_transformers import SentenceTransformer
 import faiss
 import numpy as np
-from typing import List, Dict
-from typing import Optional
+from typing import List, Dict, Optional
 
 
 class Retriever:
@@ -37,29 +36,19 @@ class Retriever:
 
 
 def rerank_results(query: str, results: List[Dict], model_name: str = "cross-encoder/ms-marco-MiniLM-L-6-v2") -> List[Dict]:
-    """Rerank a list of result dicts using a CrossEncoder. Returns results sorted by rerank score.
-
-    This is lazy: the CrossEncoder model will be downloaded on first call.
-    WARNING: This requires 8GB+ RAM. May cause kernel crashes on limited-memory systems.
-    """
     if not results:
         return results
-    
-    # Check available memory
     try:
         import psutil
         available_gb = psutil.virtual_memory().available / (1024**3)
         if available_gb < 2.0:
-            raise RuntimeError(f"Insufficient RAM: {available_gb:.1f}GB available, but reranking requires ~4GB. Skipping reranking.")
+            raise RuntimeError(f"Insufficient RAM: {available_gb:.1f}GB available. Skipping reranking.")
     except ImportError:
-        # psutil not available, proceed with warning
-        print("⚠ Warning: psutil not available. Cannot verify memory. Reranking may cause crashes on low-memory systems.")
-    
+        pass
     try:
         from sentence_transformers import CrossEncoder
     except Exception:
-        raise RuntimeError("CrossEncoder is required for reranking. Install sentence-transformers and retry.")
-
+        raise RuntimeError("CrossEncoder is required for reranking.")
     texts = [r["text"] for r in results]
     pairs = [[query, t] for t in texts]
     reranker = CrossEncoder(model_name)
@@ -70,49 +59,116 @@ def rerank_results(query: str, results: List[Dict], model_name: str = "cross-enc
     return results
 
 
+def _call_claude(prompt: str, max_tokens: int = 400) -> str:
+    """Call Claude API to synthesize a focused answer. Returns plain text."""
+    import urllib.request
+    payload = json.dumps({
+        "model": "claude-sonnet-4-20250514",
+        "max_tokens": max_tokens,
+        "messages": [{"role": "user", "content": prompt}]
+    }).encode()
+    req = urllib.request.Request(
+        "https://api.anthropic.com/v1/messages",
+        data=payload,
+        headers={"Content-Type": "application/json"},
+        method="POST"
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            data = json.loads(resp.read())
+            return data["content"][0]["text"].strip()
+    except Exception as e:
+        return ""
+
+
+def _extract_focused_answer(query: str, chunks: List[Dict]) -> str:
+    """
+    Use Claude API to extract a focused, direct answer from retrieved chunks.
+    Falls back to best-effort text extraction if API unavailable.
+    """
+    context_parts = []
+    for i, r in enumerate(chunks[:3], 1):
+        context_parts.append(f"[Chunk {i} — {r['source']} page {r['page']}]\n{r['text']}")
+    context = "\n\n".join(context_parts)
+
+    prompt = f"""You are a document assistant. Answer the question below using ONLY the provided document chunks.
+Be direct and concise. Give a 1-3 sentence answer. Do NOT mention the chunks or say "according to". 
+Just answer the question plainly. If the answer is not in the chunks, say "Not found in the documents."
+
+Question: {query}
+
+Document chunks:
+{context}
+
+Answer:"""
+
+    answer = _call_claude(prompt, max_tokens=300)
+    if answer and answer != "Not found in the documents." and len(answer) > 10:
+        return answer
+
+    # Fallback: find the single best sentence from top chunk by keyword overlap
+    import re
+    top_text = chunks[0]["text"]
+    sentences = [s.strip() for s in re.split(r'(?<=[.!?])\s+|\n', top_text) if len(s.strip()) > 25]
+    if not sentences:
+        return top_text[:300].strip()
+
+    query_words = set(re.sub(r'[^\w\s]', '', query.lower()).split())
+    stop = {'what','is','the','a','an','of','in','for','to','and','or','how','does','do',
+            'did','was','were','are','who','when','where','which','with','that','has',
+            'have','had','can','could','would','should','me','my','his','her','their'}
+    keywords = query_words - stop
+
+    def score(s):
+        words = set(re.sub(r'[^\w\s]', '', s.lower()).split())
+        return len(words & keywords)
+
+    best = max(sentences, key=score)
+    # Take best + the sentence after it for context
+    idx = sentences.index(best)
+    selected = sentences[idx: idx + 2]
+    return ' '.join(selected)
+
+
 def synthesize_answer(retrieval: Dict, score_threshold: float = 0.25) -> Dict:
-    results = retrieval["results"]
+    results = retrieval.get("results", [])
+
     if not results:
         return {"answer": "I couldn't find relevant information.", "citations": [], "low_confidence": True}
-    top_score = results[0]["score"]
+
+    # Filter results that pass threshold
+    passing = [r for r in results if r["score"] >= score_threshold]
+
+    # Build deduplicated citations
+    seen_keys = set()
     citations = []
-    snippets = []
-    for r in results:
-        citations.append(f"[{r['source']}:{r['page']}]")
-        snippets.append(r["text"])
-    if top_score < score_threshold:
+    for r in (passing if passing else results):
+        key = f"{r['source']}:{r['page']}"
+        if key not in seen_keys:
+            citations.append(f"[{r['source']}:{r['page']}]")
+            seen_keys.add(key)
+
+    if not passing:
         return {
-            "answer": "I don't have strong evidence to answer confidently. Could you clarify?",
+            "answer": "I don't have strong evidence to answer confidently. Could you clarify your question?",
             "citations": citations,
             "low_confidence": True,
             "retrieval": retrieval,
         }
-    # Better synthesis: preserve line breaks and emit bullet/point-form when appropriate
-    top_snip = snippets[0].strip()
-    # Normalize common whitespace
-    top_snip = '\n'.join(line.rstrip() for line in top_snip.splitlines() if line.strip())
 
-    # If the snippet contains multiple short lines, format as bullets for readability
-    lines = [ln for ln in top_snip.splitlines() if ln.strip()]
-    if len(lines) > 1:
-        # Heuristic: if lines are reasonably short, present as bullet points
-        avg_len = sum(len(ln) for ln in lines) / len(lines)
-        if avg_len < 140 or len(lines) <= 10:
-            formatted = '\n'.join(f"- {ln}" for ln in lines[:50])
-        else:
-            # long paragraphs: truncate to keep answers concise
-            formatted = '\n'.join(lines[:5])
-    else:
-        # Single-line or long paragraph: truncate safely
-        formatted = top_snip if len(top_snip) <= 1000 else top_snip[:1000].rsplit(' ', 1)[0] + '...'
+    query_text = retrieval.get("query", "")
+    focused = _extract_focused_answer(query_text, passing)
 
-    answer = f"{formatted}\n\nCitations: {'; '.join(citations)}"
-    return {"answer": answer, "citations": citations, "low_confidence": False, "retrieval": retrieval}
+    return {
+        "answer": focused,
+        "citations": citations,
+        "low_confidence": False,
+        "retrieval": retrieval
+    }
 
 
 if __name__ == "__main__":
     import argparse
-
     p = argparse.ArgumentParser()
     p.add_argument("index_path")
     p.add_argument("query")
