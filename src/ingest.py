@@ -37,6 +37,7 @@ def extract_pages_from_pdf(path: str) -> List[Dict]:
                 except Exception:
                     text = ""
                 text = clean_text(text)
+                text = clean_cid_artefacts(text)
                 pages.append({"page_num": i, "text": text})
         return pages
     except ImportError:
@@ -51,6 +52,7 @@ def extract_pages_from_pdf(path: str) -> List[Dict]:
         except Exception:
             text = ""
         text = clean_text(text)
+        text = clean_cid_artefacts(text)
         pages.append({"page_num": i, "text": text})
     return pages
 
@@ -127,3 +129,9 @@ if __name__ == "__main__":
     p.add_argument("--overlap", type=int, default=200)
     args = p.parse_args()
     ingest_pdfs(args.pdf_dir, args.out_chunks, args.chunk_size, args.overlap)
+
+
+def clean_cid_artefacts(text: str) -> str:
+    """Replace (cid:NNN) glyphs (unresolved bullets/symbols from pdfplumber) with bullet char."""
+    import re
+    return re.sub(r'\(cid:\d+\)', '•', text)
